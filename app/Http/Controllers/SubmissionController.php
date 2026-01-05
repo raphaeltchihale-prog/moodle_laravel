@@ -19,47 +19,36 @@ class SubmissionController extends Controller
         $this->submissionService = $submissionService;
     }
 
+    // Affiche les soumissions pour un module
     public function index($moduleId)
     {
         $module = Module::findOrFail($moduleId);
-        $assignment = $module->assignment;
-        
-        if (!$assignment) {
-            return redirect()->back()->with('error', 'No assignment found for this module');
-        }
 
-        // Synchroniser avec Moodle
-        $submissions = $this->submissionService->getSubmissions($assignment->moodle_id);
-        
+        $assignments = $module->assignments; // si plusieurs assignments
+        $submissions = Submission::with(['student', 'assignment', 'grade'])
+                                ->whereIn('assignment_id', $assignments->pluck('id'))
+                                ->get();
+
         return view('assignment-submissions', [
             'module' => $module,
-            'submissions' => $submissions,
-            'assignment' => $assignment
+            'assignments' => $assignments,
+            'submissions' => $submissions
         ]);
     }
 
-    // public function show(Submission $submission)
-    // {
-    //     $submissionQuestions = SubmissionQuestion::where('submission_id', $submission->id)->get();
-    //     return view('submissions.show', compact('submission', 'submissionQuestions'));
-    // }
-
+    // Créer une soumission
     public function store(Request $request, $moduleId)
     {
         $module = Module::findOrFail($moduleId);
-        $assignment = $module->assignment;
-        
+        $assignment = $module->assignment; // ou $module->assignments->first() si multiple
+
         $request->validate([
             'content' => 'required_without:file|string',
             'file' => 'required_without:content|file|mimes:pdf,txt|max:5120'
         ]);
 
-        $filePath = null;
-        if ($request->hasFile('file')) {
-            $filePath = $request->file('file')->store('submissions');
-        }
+        $filePath = $request->hasFile('file') ? $request->file('file')->store('submissions') : null;
 
-        // Créer la soumission locale
         $submission = Submission::create([
             'assignment_id' => $assignment->id,
             'user_id' => Auth::id(),
@@ -69,24 +58,24 @@ class SubmissionController extends Controller
             'submitted_at' => now()
         ]);
 
-        // Synchroniser avec Moodle
-        $success = $this->submissionService->submitAssignment(
+        // Synchroniser avec Moodle (optionnel)
+        $this->submissionService->submitAssignment(
             $assignment->moodle_id,
             Auth::user()->moodle_id,
             $request->content,
-            $request->file('file')
+            $request->file('file') ?? null
         );
 
-        if ($success) {
-            return redirect()->back()->with('success', 'Submission successful!');
-        }
-
-        return redirect()->back()->with('error', 'Failed to submit to Moodle');
+        return redirect()->back()->with('success', 'Submission successful!');
     }
 
+    // Noter une soumission
     public function grade(Request $request, Submission $submission)
     {
-        if (!Auth::user() || !Auth::user()->role === 'ROLE_TEACHER') {
+        $user = Auth::user();
+
+        // Vérifier le rôle correctement
+        if (!$user || !$user->hasRole('ROLE_TEACHER')) {
             return redirect()->back()->with('error', 'Unauthorized action');
         }
 
@@ -95,26 +84,23 @@ class SubmissionController extends Controller
             'feedback' => 'nullable|string'
         ]);
 
-        // Sauvegarder localement
+        // Sauvegarder la note localement
         Grade::updateOrCreate(
             ['submission_id' => $submission->id],
             [
                 'grade' => $request->grade,
                 'comment' => $request->feedback,
-                'teacher_id' => Auth::id()
+                'teacher_id' => $user->id
             ]
         );
 
         $submission->update(['status' => 'graded']);
 
         // Synchroniser avec Moodle
-        $moodleAssignmentId = $submission->assignment->moodle_id;
-        $moodleUserId = $submission->user->moodle_id;
-        
         $success = $this->submissionService->saveGrade(
-            $moodleAssignmentId,
-            $moodleUserId,
-            $request->grade * 5, // Convertir sur 100
+            $submission->assignment->moodle_id,
+            $submission->user->moodle_id,
+            $request->grade * 5, // Convertir sur 100 si besoin
             $request->feedback
         );
 
